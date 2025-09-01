@@ -682,91 +682,103 @@ class OpenAIServingChat(OpenAIServingBase):
         return response
 
     def _build_chat_response(
-        self,
-        request: ChatCompletionRequest,
-        ret: List[Dict[str, Any]],
-        created: int,
-    ) -> Union[ChatCompletionResponse, ORJSONResponse]:
-        """Build chat completion response from generation results"""
-        choices = []
+    self,
+    request: ChatCompletionRequest,
+    ret: List[Dict[str, Any]],
+    created: int,
+) -> Union[ChatCompletionResponse, ORJSONResponse]:
+    """Build chat completion response from generation results"""
+    choices = []
 
-        for idx, ret_item in enumerate(ret):
-            # Process logprobs
-            choice_logprobs = None
-            if request.logprobs:
-                choice_logprobs = self._process_response_logprobs(ret_item)
+    harmony_tags = [
+        "<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|end|>", "<|call|>", "<|return|>"
+    ]
+    for idx, ret_item in enumerate(ret):
+        # Process logprobs
+        choice_logprobs = None
+        if request.logprobs:
+            choice_logprobs = self._process_response_logprobs(ret_item)
 
-            # Handle hidden states
-            hidden_states = process_hidden_states_from_ret(ret_item, request)
+        # Handle hidden states
+        hidden_states = process_hidden_states_from_ret(ret_item, request)
 
-            finish_reason = ret_item["meta_info"]["finish_reason"]
-            text = ret_item["text"]
+        finish_reason = ret_item["meta_info"]["finish_reason"]
+        text = ret_item["text"]
 
-            # Handle reasoning content
-            reasoning_text = None
-            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-            if reasoning_parser and request.separate_reasoning:
-                is_force_reasoning = (
-                    self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
-                )
-                try:
-                    parser = ReasoningParser(
-                        model_type=reasoning_parser,
-                        stream_reasoning=False,
-                        force_reasoning=is_force_reasoning,
-                    )
-                    reasoning_text, text = parser.parse_non_stream(text)
-                except Exception as e:
-                    logger.error(f"Reasoning parsing error: {e}")
-                    return self.create_error_response(
-                        "Failed to parse reasoning content",
-                        err_type="InternalServerError",
-                        status_code=500,
-                    )
-
-            # Handle tool calls
-            tool_calls = None
-            if request.tool_choice != "none" and request.tools:
-                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
-                )
-
-            choice_data = ChatCompletionResponseChoice(
-                index=idx,
-                message=ChatMessage(
-                    role="assistant",
-                    content=text if text else None,
-                    tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
-                ),
-                logprobs=choice_logprobs,
-                finish_reason=finish_reason["type"] if finish_reason else None,
-                matched_stop=(
-                    finish_reason["matched"]
-                    if finish_reason and "matched" in finish_reason
-                    else None
-                ),
-                hidden_states=hidden_states,
+        # Handle reasoning content
+        reasoning_text = None
+        reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        if reasoning_parser and request.separate_reasoning:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_enable_thinking_from_request(request)
             )
-            choices.append(choice_data)
+            try:
+                parser = ReasoningParser(
+                    model_type=reasoning_parser,
+                    stream_reasoning=False,
+                    force_reasoning=is_force_reasoning,
+                )
+                reasoning_text, text = parser.parse_non_stream(text)
+            except Exception as e:
+                logger.error(f"Reasoning parsing error: {e}")
+                return self.create_error_response(
+                    str(e),
+                    err_type="BadRequest",
+                    status_code=400,
+                )
 
-        # Calculate usage
-        usage = UsageProcessor.calculate_response_usage(
-            ret,
-            n_choices=request.n,
-            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
-        )
+        # PATCH: Harmony format validation
+        # If the final content contains any Harmony tags, this is user/model error
+        if text is not None and any(tag in text for tag in harmony_tags):
+            return self.create_error_response(
+                "Bad request: You have passed a message containing <|channel|> tags in the content field. Instead of doing this, you should pass analysis messages (the string between '<|message|>' and '<|end|>') in the 'thinking' field, and final messages (the string between '<|message|>' and '<|end|>') in the 'content' field.",
+                err_type="BadRequest",
+                status_code=400,
+            )
 
-        return ChatCompletionResponse(
-            id=ret[0]["meta_info"]["id"],
-            created=created,
-            model=request.model,
-            choices=choices,
-            usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+        # Handle tool calls
+        tool_calls = None
+        if request.tool_choice != "none" and request.tools:
+            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            tool_calls, text, finish_reason = self._process_tool_calls(
+                text, request.tools, tool_call_parser, finish_reason
+            )
+
+        choice_data = ChatCompletionResponseChoice(
+            index=idx,
+            message=ChatMessage(
+                role="assistant",
+                content=text if text else None,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_text if reasoning_text else None,
+            ),
+            logprobs=choice_logprobs,
+            finish_reason=finish_reason["type"] if finish_reason else None,
+            matched_stop=(
+                finish_reason["matched"]
+                if finish_reason and "matched" in finish_reason
+                else None
+            ),
+            hidden_states=hidden_states,
         )
+        choices.append(choice_data)
+
+    # Calculate usage
+    usage = UsageProcessor.calculate_response_usage(
+        ret,
+        n_choices=request.n,
+        enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+    )
+
+    return ChatCompletionResponse(
+        id=ret[0]["meta_info"]["id"],
+        created=created,
+        model=request.model,
+        choices=choices,
+        usage=usage,
+        metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+    )
 
     def _process_logprobs_tokens(
         self, logprobs: LogProbs, use_token_index: bool = False
